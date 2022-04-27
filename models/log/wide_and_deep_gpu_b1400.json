@@ -1,10 +1,10 @@
 {
-    "file_name": "dlrm_s_caffe2",
+    "file_name": "wide_and_deep",
     "args": {
         "arch_sparse_feature_size": 32,
-        "arch_embedding_size": "2000000-2000000-2000000-2000000-2000000-2000000-2000000-2000000-2000000-2000000",
-        "arch_mlp_bot": "2560-1024-256-32",
-        "arch_mlp_top": "512-256-1",
+        "arch_embedding_size": "1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000",
+        "arch_mlp_bot": "512",
+        "arch_mlp_top": "1024-512-256-1",
         "arch_mlp_tasks": "4-2-1",
         "num_multi_tasks": 1,
         "hidden_size": 64,
@@ -13,7 +13,7 @@
         "inter_op_workers": 1,
         "sls_workers": 1,
         "fc_workers": 1,
-        "model_type": "dlrm",
+        "model_type": "wnd",
         "user_behavior_tables": 1000,
         "inference_only": true,
         "save_proto_types_shapes": false,
@@ -33,7 +33,7 @@
         "processed_data_file": "",
         "data_randomize": "total",
         "data_trace_enable_padding": false,
-        "num_indices_per_lookup": 20,
+        "num_indices_per_lookup": 1,
         "num_indices_per_lookup_fixed": true,
         "queue": false,
         "inference_engines": 1,
@@ -52,7 +52,7 @@
         "use_accel": true,
         "model_accel": false,
         "accel_request_size_thres": 1024,
-        "model_name": "rm3",
+        "model_name": "wnd",
         "accel_root_dir": "accelerator/",
         "activation_function": "relu",
         "loss_function": "mse",
@@ -71,12 +71,12 @@
         "enable_profiling": true,
         "plot_compute_graph": false,
         "log_file": "log/output.log",
-        "config_file": "configs/dlrm_rm3.json"
+        "config_file": "configs/wide_and_deep.json"
     },
-    "Total_data_loading_time": 68935.3404045105,
-    "Total_data_loading_time_per_iter": 1.538735276886395,
-    "Total_computation_time": 53856.36520385742,
-    "Total_computation_time_per_iter": 1.2021510090146745,
-    "Total_execution_time": 122791.70560836792,
-    "Total_execution_time_per_iter": 2.7408862859010696
+    "Total_data_loading_time": 134100.9237766266,
+    "Total_data_loading_time_per_iter": 2.9933241914425577,
+    "Total_computation_time": 87705.88707923889,
+    "Total_computation_time_per_iter": 1.957720693733011,
+    "Total_execution_time": 221806.81085586548,
+    "Total_execution_time_per_iter": 4.951044885175569
 }

@@ -559,13 +559,14 @@ class DIEN_Net(object):
             workspace.RunNet(self.model.net)
         return load_time
 
+# +
 if __name__ == "__main__":
     ### import packages ###
     import sys
     import argparse
 
-    sys.path.append("..")
-    sys.path.append("../..")
+    sys.path.append("..").  # 상위 폴더에 있는 파일들을 import하기 위해 사용
+    sys.path.append("../..") 
     # data generation
     from data_generator.dlrm_data_caffe2 import DLRMDataGenerator
 
@@ -651,3 +652,10 @@ if __name__ == "__main__":
     print("Total computation time: ***", (total_time - dload_time) / (args.nepochs * nbatches), " ms/iter")
     print("Total execution time: ***", total_time, " ms")
     print("Total execution time: ***", total_time / (args.nepochs * nbatches), " ms/iter")
+    
+    from utils.logging import save_log
+    import sys
+    file_name = sys._getframe().f_code.co_filename.split(".")[0]
+    save_log(args, file_name, dload_time, total_time, nbatches)
+
+        

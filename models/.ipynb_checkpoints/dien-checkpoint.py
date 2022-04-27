@@ -1,56 +1,6 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-#
-# Description: an implementation of a deep learning recommendation model (DLRM)
-# The model input consists of dense and sparse features. The former is a vector
-# of floating point values. The latter is a list of sparse indices into
-# embedding tables, which consist of vectors of floating point values.
-# The selected vectors are passed to mlp networks denoted by triangles,
-# in some cases the vectors are interacted through operators (Ops).
-#
-# output:
-#                         vector of values
-# model:                        |
-#                              /\
-#                             /__\
-#                               |
-#       _____________________> Op  <___________________
-#     /                         |                      \
-#    /\                        /\                      /\
-#   /__\                      /__\           ...      /__\
-#    |                          |                       |
-#    |                         Op                      Op
-#    |                    ____/__\_____           ____/__\____
-#    |                   |_Emb_|____|__|    ...  |_Emb_|__|___|
-# input:
-# [ dense features ]     [sparse indices] , ..., [sparse indices]
-#
-# More precise definition of model layers:
-# 1) fully connected layers of an mlp
-# z = f(y)
-# y = Wx + b
-#
-# 2) embedding lookup (for a list of sparse indices p=[p1,...,pk])
-# z = Op(e1,...,ek)
-# obtain vectors e1=E[:,p1], ..., ek=E[:,pk]
-#
-# 3) Operator Op can be one of the following
-# Sum(e1,...,ek) = e1 + ... + ek
-# Dot(e1,...,ek) = [e1'e1, ..., e1'ek, ..., ek'e1, ..., ek'ek]
-# Cat(e1,...,ek) = [e1', ..., ek']'
-# where ' denotes transpose operation
-#
-# References:
-# [1] Maxim Naumov, Dheevatsa Mudigere, Hao-Jun Michael Shi, Jianyu Huang,
-# Narayanan Sundaram, Jongsoo Park, Xiaodong Wang, Udit Gupta, Carole-Jean Wu,
-# Alisson G. Azzolini, Dmytro Dzhulgakov, Andrey Mallevich, Ilia Cherniavskii,
-# Yinghai Lu, Raghuraman Krishnamoorthi, Ansha Yu, Volodymyr Kondratenko,
-# Stephanie Pereia, Xianjie Chen, Wenlin Chen, Vijay Rao, Bill Jia, Liang Xiong,
-# Misha Smelyanskiy, "Deep Learning Recommendation Model for Personalization and
-# Recommendation Systems", CoRR, arXiv:1906.00091, 2019
-
+# Following model architecture specified by Deep Interest Network paper
+# (Alibaba)
+# https://arxiv.org/pdf/1706.06978.pdf
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import functools
@@ -62,21 +12,19 @@ import time
 # numpy
 import numpy as np
 
-# cProfile
-import cProfile
-
 # caffe2
 from caffe2.proto import caffe2_pb2
-from caffe2.python import brew, core, dyndep, model_helper, net_drawer, workspace
+from caffe2.python import brew, core, model_helper, net_drawer, workspace, rnn_cell
+# import rnn
 from numpy import random as ra
 import caffe2.python._import_c_extension as C
 import sys
 
 # =============================================================================
-# Define wrapper for dlrm in Caffe2
-# This is to decouple input queues for DLRM network and the DLRM network itself
+# define wrapper for dien in Caffe2
+# This is to decouple input queues for DIEN network and the DIEN network itself
 # =============================================================================
-class DLRM_Wrapper(object):
+class DIEN_Wrapper(object):
     def FeedBlobWrapper(self, tag, val):
         if self.accel_en:
             _d = core.DeviceOption(caffe2_pb2.CUDA, 0)
@@ -92,7 +40,7 @@ class DLRM_Wrapper(object):
         tag=None,
         enable_prof=False,
     ):
-        super(DLRM_Wrapper, self).__init__()
+        super(DIEN_Wrapper, self).__init__()
         self.args = cli_args
 
         # Accel Enable Flags
@@ -110,11 +58,11 @@ class DLRM_Wrapper(object):
 
         num_tables = len(cli_args.arch_embedding_size.split("-"))
 
-        # We require 3 datastructures in caffe2 to enable non-blocking inputs for DLRM
+        # We require 3 datastructures in caffe2 to enable non-blocking inputs for DIEN
         # At a high-level each input needs an input queue. Inputs are enqueued
         # when they arrive on the "server" or "core" and dequeued by the
         # model's inference engine
-        # Input Blob -> Input Net -> ID Q ===> DLRM model
+        # Input Blob -> Input Net -> ID Q ===> DIEN model
         self.id_qs          = []
         self.id_input_blobs = []
         self.id_input_nets  = []
@@ -124,48 +72,58 @@ class DLRM_Wrapper(object):
         self.len_input_blobs = []
         self.len_input_nets  = []
 
+        self.seq_q, self.seq_input_blob, self.seq_input_net = self.build_dien_seq_queue()
+        self.hid_q, self.hid_input_blob, self.hid_input_net = self.build_dien_hid_queue()
+
         for i in range(num_tables):
 
-            q, input_blob, net = self.build_dlrm_sparse_queue(tag="id", qid=i)
+            q, input_blob, net = self.build_dien_sparse_queue(tag="id", qid=i)
             self.id_qs.append(q)
             self.id_input_blobs.append(input_blob)
             self.id_input_nets.append(net)
 
-            q, input_blob, net = self.build_dlrm_sparse_queue(tag="len", qid=i)
+            q, input_blob, net = self.build_dien_sparse_queue(tag="len", qid=i)
             self.len_qs.append(q)
             self.len_input_blobs.append(input_blob)
             self.len_input_nets.append(net)
 
-        self.fc_q, self.fc_input_blob, self.fc_input_net = self.build_dlrm_fc_queue()
-
         if self.args.queue:
             with core.DeviceScope(device_opt):
-                self.dlrm = DLRM_Net(cli_args, model, tag, enable_prof,
+                self.dien = DIEN_Net(cli_args, model, tag, enable_prof,
                                      id_qs = self.id_qs,
                                      len_qs = self.len_qs,
-                                     fc_q   = self.fc_q)
+                                     seq_q = self.seq_q,
+                                     hid_q = self.hid_q)
         else:
             with core.DeviceScope(device_opt):
-                self.dlrm = DLRM_Net(cli_args, model, tag, enable_prof)
+                self.dien = DIEN_Net(cli_args, model, tag, enable_prof)
 
 
     def create(self, X, S_lengths, S_indices, T):
         if self.args.queue:
-            self.dlrm.create(X, S_lengths, S_indices, T,
+            self.dien.create(X, S_lengths, S_indices, T,
                              id_qs = self.id_qs,
                              len_qs = self.len_qs)
         else:
-            self.dlrm.create(X, S_lengths, S_indices, T)
+            self.dien.create(X, S_lengths, S_indices, T)
 
 
-    # Run the Queues to provide inputs to DLRM model
+    # Run the Queues to provide inputs to DIEN model
     def run_queues(self, ids, lengths, fc, batch_size):
-        # Dense features
-        self.FeedBlobWrapper(self.fc_input_blob, fc)
-        workspace.RunNetOnce(self.fc_input_net.Proto())
-
         # Sparse features
+        ln_emb = np.fromstring(self.args.arch_embedding_size, dtype=int, sep="-")
         num_tables = len(self.args.arch_embedding_size.split("-"))
+        sequence_lengths = np.zeros(batch_size).astype(np.int32)
+        sequence_lengths += (len(ln_emb) - 3)
+
+        initial_h_data = np.zeros( (batch_size, self.args.hidden_size) ).astype(np.float32)
+
+        self.FeedBlobWrapper( self.seq_input_blob, sequence_lengths)
+        self.FeedBlobWrapper( self.hid_input_blob, initial_h_data)
+
+        workspace.RunNetOnce( self.seq_input_net.Proto() )
+        workspace.RunNetOnce( self.hid_input_net.Proto() )
+
         for i in range(num_tables):
            self.FeedBlobWrapper( self.id_input_blobs[i], ids[i])
            workspace.RunNetOnce( self.id_input_nets[i].Proto() )
@@ -173,17 +131,19 @@ class DLRM_Wrapper(object):
            self.FeedBlobWrapper( self.len_input_blobs[i], lengths[i])
            workspace.RunNetOnce( self.len_input_nets[i].Proto() )
     # =========================================================================
-    # Helper functions to build queues for DLRM inputs (IDs, Lengths, FC)
+    # Helper  functions to build queues for DIEN inputs (IDs, Lengths, FC)
     # in order to decouple blocking input operations
     # =========================================================================
-    def build_dlrm_sparse_queue(self, tag = "id", qid = None):
+    def build_dien_sparse_queue(self, tag = "id", qid = None):
         q_net_name = tag + '_q_init_' + str(qid)
         q_net = core.Net(q_net_name)
 
         q_input_blob_name = tag + '_q_blob_' + str(qid)
 
         with core.DeviceScope(core.DeviceOption(caffe2_pb2.CPU)):
-            q = q_net.CreateBlobsQueue([],q_input_blob_name,num_blobs=1,capacity=8)
+            q = q_net.CreateBlobsQueue([], q_input_blob_name,
+                                           num_blobs=1,
+                                           capacity=8)
 
         workspace.RunNetOnce(q_net)
 
@@ -193,25 +153,48 @@ class DLRM_Wrapper(object):
 
         return q, input_blob_name, input_net
 
-    def build_dlrm_fc_queue(self, ):
-        fc_q_net_name = 'fc_q_init'
-        fc_q_net = core.Net(fc_q_net_name)
+    def build_dien_seq_queue(self, ):
+        seq_q_net_name = 'seq_q_init'
+        seq_q_net = core.Net(seq_q_net_name)
 
-        fc_q_input_blob_name = 'fc_q_blob'
+        seq_q_input_blob_name = 'seq_q_blob'
 
         with core.DeviceScope(core.DeviceOption(caffe2_pb2.CPU)):
-            fc_q = fc_q_net.CreateBlobsQueue([],fc_q_input_blob_name,num_blobs=1,capacity=8)
+            seq_q = seq_q_net.CreateBlobsQueue([],
+                                             seq_q_input_blob_name,
+                                             num_blobs=1,
+                                             capacity=8)
 
-        workspace.RunNetOnce(fc_q_net)
+        workspace.RunNetOnce(seq_q_net)
 
-        fc_input_blob_name = 'fc_inputs'
-        fc_input_net = core.Net('fc_input_net')
-        fc_input_net.EnqueueBlobs([fc_q, fc_input_blob_name], [fc_input_blob_name])
+        seq_input_blob_name = 'seq_inputs'
+        seq_input_net = core.Net('seq_input_net')
+        seq_input_net.EnqueueBlobs([seq_q, seq_input_blob_name], [seq_input_blob_name])
 
-        return fc_q, fc_input_blob_name, fc_input_net
+        return seq_q, seq_input_blob_name, seq_input_net
+
+    def build_dien_hid_queue(self, ):
+        hid_q_net_name = 'hid_q_init'
+        hid_q_net = core.Net(hid_q_net_name)
+
+        hid_q_input_blob_name = 'hid_q_blob'
+
+        with core.DeviceScope(core.DeviceOption(caffe2_pb2.CPU)):
+            hid_q = hid_q_net.CreateBlobsQueue([],
+                                             hid_q_input_blob_name,
+                                             num_blobs=1,
+                                             capacity=8)
+
+        workspace.RunNetOnce(hid_q_net)
+
+        hid_input_blob_name = 'hid_inputs'
+        hid_input_net = core.Net('hid_input_net')
+        hid_input_net.EnqueueBlobs([hid_q, hid_input_blob_name], [hid_input_blob_name])
+
+        return hid_q, hid_input_blob_name, hid_input_net
 
 
-class DLRM_Net(object):
+class DIEN_Net(object):
     def FeedBlobWrapper(self, tag, val):
         if self.accel_en:
             _d = core.DeviceOption(caffe2_pb2.CUDA, 0)
@@ -220,7 +203,7 @@ class DLRM_Net(object):
         else:
             workspace.FeedBlob(tag, val)
 
-    def create_mlp(self, ln, sigmoid_layer, model, tag, fc_q = None):
+    def create_mlp(self, ln, model, tag, fc_q = None):
         (tag_layer, tag_in, tag_out) = tag
 
         # build MLP layer by layer
@@ -247,7 +230,6 @@ class DLRM_Net(object):
             W = np.random.normal(mean, std_dev, size=(m, n)).astype(np.float32)
             std_dev = np.sqrt(1 / m) # np.sqrt(2 / (m + 1))
             b = np.random.normal(mean, std_dev, size=m).astype(np.float32)
-            # with core.DeviceScope(core.DeviceOption(caffe2_pb2.CUDA, 0)):
             self.FeedBlobWrapper(tag_fc_w, W)
             self.FeedBlobWrapper(tag_fc_b, b)
 
@@ -265,11 +247,7 @@ class DLRM_Net(object):
 
             layers.append(fc)
 
-            if i == sigmoid_layer:
-                layer = model.net.Sigmoid(tag_fc_y, tag_fc_z)
-
-            else:
-                layer = model.net.Relu(tag_fc_y, tag_fc_z)
+            layer = model.net.Relu(tag_fc_y, tag_fc_z)
             tag_in = tag_fc_z
             layers.append(layer)
 
@@ -299,8 +277,8 @@ class DLRM_Net(object):
                                   size=(n, m)).astype(np.float32)
             # approach 1b: numpy rand
             # W = ra.rand(n, m).astype(np.float32)
-            # with core.DeviceScope(core.DeviceOption(caffe2_pb2.CUDA, 0)):
             self.FeedBlobWrapper(tbl_s, W)
+
             if self.args.queue:
                 # If want to have non-blocking IDs we have to dequue the input
                 # ID blobs on the model side
@@ -308,7 +286,7 @@ class DLRM_Net(object):
                 model.net.Cast(ind_s + "_pre_cast", ind_s,
                                to=core.DataType.INT32)
                 # Operator Mod is not found in Caffe2 latest build
-                # model.net.Mod(ind_s + "_pre_mod", ind_s, divisor = n)
+                #model.net.Mod(ind_s + "_pre_mod", ind_s, divisor = n)
 
                 # Dequeue lengths vector as well
                 model.net.DequeueBlobs(len_qs[i], len_s)
@@ -317,76 +295,143 @@ class DLRM_Net(object):
             if self.accel_en:
                 with core.DeviceScope(core.DeviceOption(caffe2_pb2.CUDA, 0)):
                     EE = model.net.SparseLengthsSum([tbl_s, ind_s, len_s], [sum_s],
-                        engine=self.args.engine,
-                        max_num_tasks=self.args.sls_workers)
+                                                    engine=self.args.engine,
+                                                    max_num_tasks=self.args.sls_workers)
             else:
                 EE = model.net.SparseLengthsSum([tbl_s, ind_s, len_s], [sum_s],
                     engine=self.args.engine,
                     max_num_tasks=self.args.sls_workers)
-
             emb_l.append(EE)
 
         return emb_l, weights_l
 
-    def create_interactions(self, x, ly, model, tag):
-        (tag_dense_in, tag_sparse_in, tag_int_out) = tag
+    def create_gru_unit(self, emb_ls, user_emb_ids, model, tag, seq_q, hid_q):
+        (tag_layer, tag_in, tag_out) = tag
 
-        if self.arch_interaction_op == "dot":
-            # concatenate dense and sparse features
-            tag_int_out_info = tag_int_out + "_info"
-            T, T_info = model.net.Concat(
-                x + ly,
-                [tag_int_out + "_cat_axis0", tag_int_out_info + "_cat_axis0"],
-                axis=1,
-                add_axis=1,
-            )
-            # perform a dot product
-            Z = model.net.BatchMatMul([T, T], tag_int_out + "_matmul", trans_b=1)
-            # append dense feature with the interactions (into a row vector)
-            # approach 1: all
-            # Zflat = model.net.Flatten(Z, tag_int_out + "_flatten", axis=1)
-            # approach 2: unique
-            Zflat_all = model.net.Flatten(Z, tag_int_out + "_flatten_all", axis=1)
-            Zflat = model.net.BatchGather([Zflat_all, tag_int_out +"_tril_indices"],
-                                           tag_int_out + "_flatten")
-            R, R_info = model.net.Concat(
-                x + [Zflat], [tag_int_out, tag_int_out_info], axis=1
-            )
-        elif self.arch_interaction_op == "cat":
-            # concatenation features (into a row vector)
-            tag_int_out_info = tag_int_out + "_info"
-            R, R_info = model.net.Concat(
-                x + ly, [tag_int_out, tag_int_out_info], axis=1
-            )
-        else:
-            sys.exit("ERROR: --arch-interaction-op="
-                     + self.arch_interaction_op + " is not supported")
+        emb_ls_str = []
+        for user_emb_id in user_emb_ids:
+            emb_ls_str.append( emb_ls[user_emb_id] )
 
-        return R
+        tag_cat = tag_layer + ":::_rnn_inputs"
+        tag_cat_info = tag_cat + "_info"
+        rnn_inputs, info = model.net.Concat( emb_ls_str, [tag_cat, tag_cat_info])
+        rnn_shape = model.net.Reshape(rnn_inputs, [tag_layer + ":::rnn_shape", "old_shape"],
+                shape=(len(user_emb_ids), -1, self.input_size))
 
-    def create_sequential_forward_ops(self, id_qs = None, len_qs = None, fc_q = None):
+        gates_t_w_data = np.random.randn( self.args.hidden_size, self.args.hidden_size).astype(np.float32)
+        gates_t_b_data = np.random.randn( self.args.hidden_size).astype(np.float32)
+        i2h_w_data     = np.random.randn( self.args.hidden_size, self.input_size).astype(np.float32)
+        i2h_b_data     = np.random.randn( self.args.hidden_size).astype(np.float32)
+
+        self.FeedBlobWrapper( 'rnn_0/gates_t_w', gates_t_w_data)
+        self.FeedBlobWrapper( 'rnn_0/gates_t_b', gates_t_b_data)
+        self.FeedBlobWrapper( 'rnn_0/i2h_w', i2h_w_data)
+        self.FeedBlobWrapper( 'rnn_0/i2h_b', i2h_b_data)
+
+        if  seq_q:
+            model.net.DequeueBlobs(seq_q, "seq_lengths")
+        if  hid_q:
+            model.net.DequeueBlobs(hid_q, "initial_h")
+
+        rnn_0_out, _ = rnn_cell.BasicRNN(model,
+                            tag_layer + ":::rnn_shape",
+                            'seq_lengths',
+                            ['initial_h'],
+                            self.input_size,
+                            self.args.hidden_size,
+                            "rnn_0",
+                            activation="tanh",
+                            forward_only=True)
+
+        output = brew.fc( self.model,
+                          rnn_0_out,
+                          None,
+                          dim_in = self.args.hidden_size,
+                          dim_out= self.args.hidden_size,
+                          axis=2,
+                          engine=self.args.engine,
+                          max_num_tasks=self.args.fc_workers)
+
+        output = brew.softmax(self.model, output, axis=2)
+        output = brew.sum(self.model, rnn_0_out, output, axis=2)
+
+        # TODO: Need to make input_h_data an input to the overall model due to
+        # batch-size
+        gates_t_w_data = np.random.randn( self.args.hidden_size, self.args.hidden_size).astype(np.float32)
+        gates_t_b_data = np.random.randn( self.args.hidden_size).astype(np.float32)
+        i2h_w_data     = np.random.randn( self.args.hidden_size, self.args.hidden_size).astype(np.float32)
+        i2h_b_data     = np.random.randn( self.args.hidden_size).astype(np.float32)
+
+        self.FeedBlobWrapper( 'rnn_1/gates_t_w', gates_t_w_data)
+        self.FeedBlobWrapper( 'rnn_1/gates_t_b', gates_t_b_data)
+        self.FeedBlobWrapper( 'rnn_1/i2h_w', i2h_w_data)
+        self.FeedBlobWrapper( 'rnn_1/i2h_b', i2h_b_data)
+
+        rnn_1_all_out, rnn_1_out = rnn_cell.BasicRNN(model,
+                                                    output,
+                                                    'seq_lengths',
+                                                    ['initial_h'],
+                                                    self.args.hidden_size,
+                                                    self.args.hidden_size,
+                                                    "rnn_1",
+                                                    activation="tanh",
+                                                    forward_only=True)
+
+        return rnn_1_out
+
+
+    def create_sequential_forward_ops(self, id_qs = None, len_qs = None, seq_q = None, hid_q = None):
+        self.input_size  = self.args.arch_sparse_feature_size
+
         # embeddings
         tag = (self.temb, self.tsin, self.tsout)
         self.emb_l, self.emb_w = self.create_emb(self.m_spa, self.ln_emb,
                                                     self.model, tag,
                                                     id_qs = id_qs,
                                                     len_qs = len_qs)
-        # bottom mlp
-        tag = (self.tbot, self.tdin, self.tdout)
-        self.bot_l, self.bot_w = self.create_mlp(self.ln_bot, self.sigmoid_bot,
-                                                 self.model, tag, fc_q = fc_q)
-        # interactions
-        tag = (self.tdout, self.tsout, self.tint)
-        Z = self.create_interactions([self.bot_l[-1]], self.emb_l, self.model, tag)
 
-        # top mlp
-        tag = (self.ttop, Z, self.tout)
-        self.top_l, self.top_w = self.create_mlp(self.ln_top, self.sigmoid_top,
-                                                 self.model, tag
-        )
+        # Deep Interest network has 4 types of features, user profile, user
+        # behavior, candidate ad, context features
+        user_profile_emb      = 0
+        user_behavior_emb     = list(range(1, len(self.ln_emb) - 2))
+        candidate_ad_emb      = len(self.ln_emb) - 2
+        context_features_emb  = len(self.ln_emb) - 1
+        '''
+        print(user_profile_emb)
+        print(user_behavior_emb)
+        print(candidate_ad_emb)
+        print(context_features_emb)
+        '''
 
-        # setup the last output variable
+        tag = (self.tgru, self.tsout, self.tgruout)
+        gru_out = self.create_gru_unit(self.emb_l,
+                                       user_behavior_emb,
+                                       self.model,
+                                       tag,
+                                       seq_q = seq_q,
+                                       hid_q = hid_q)
+
+        out = self.model.net.Flatten(gru_out, axis=2)
+
+        concat_inputs = [out] + [self.emb_l[user_profile_emb]]
+        concat_inputs += [self.emb_l[candidate_ad_emb]]
+        concat_inputs += [self.emb_l[context_features_emb]]
+        tag = self.tgru + ":::concat"
+        tag_info = tag + "_info"
+        topFC_in, _ = self.model.net.Concat( concat_inputs, [tag, tag_info])
+
+        # There are 4 sets out output in DIEN: User profile, user behavior,
+        # candidate ad, context features
+        # As aresult we must have at least 4 embedding tables
+        num_int = self.args.hidden_size + (3 * self.args.arch_sparse_feature_size)
+
+        arch_mlp_top_adjusted = str(num_int) + "-" + self.args.arch_mlp_top
+        ln_top = np.fromstring(arch_mlp_top_adjusted, dtype=int, sep="-")
+        tag = (self.ttop, topFC_in, self.tout)
+        self.top_l, self.top_w = self.create_mlp(ln_top, self.model, tag)
+        ## setup the last output variable
         self.last_output = self.top_l[-1]
+
 
     def __init__(
         self,
@@ -396,111 +441,57 @@ class DLRM_Net(object):
         enable_prof=False,
         id_qs = None,
         len_qs = None,
-        fc_q  = None
+        seq_q = None,
+        hid_q = None
     ):
-        super(DLRM_Net, self).__init__()
+        super(DIEN_Net, self).__init__()
         self.args = cli_args
-
-        ### parse command line arguments ###
-        ln_bot = np.fromstring(cli_args.arch_mlp_bot, dtype=int, sep="-")
-        m_den = ln_bot[0]
 
         m_spa = cli_args.arch_sparse_feature_size
         ln_emb = np.fromstring(cli_args.arch_embedding_size, dtype=int, sep="-")
         num_fea = ln_emb.size + 1  # num sparse + num dense features
-        m_den_out = ln_bot[ln_bot.size - 1]
 
         accel_en = self.args.use_accel
 
-        if cli_args.arch_interaction_op == "dot":
-            # approach 1: all
-            # num_int = num_fea * num_fea + m_den_out
-            # approach 2: unique
-            if cli_args.arch_interaction_itself:
-                num_int = (num_fea * (num_fea + 1)) // 2 + m_den_out
-            else:
-                num_int = (num_fea * (num_fea - 1)) // 2 + m_den_out
-        elif cli_args.arch_interaction_op == "cat":
-            num_int = num_fea * m_den_out
-        else:
-            sys.exit("ERROR: --arch-interaction-op="
-                     + cli_args.arch_interaction_op + " is not supported")
+        assert( len(ln_emb) >= 4 )
 
-        arch_mlp_top_adjusted = str(num_int) + "-" + cli_args.arch_mlp_top
-        ln_top = np.fromstring(arch_mlp_top_adjusted, dtype=int, sep="-")
+        global_init_opt = ["caffe2", "--caffe2_log_level=1"]
+        workspace.GlobalInit(global_init_opt)
+        self.set_tags()
+        self.model = model_helper.ModelHelper(name="DIEN", init_params=True)
 
-        if m_den != ln_bot[0]:
-            sys.exit("ERROR: arch-dense-feature-size "
-                + str(m_den) + " does not match first dim of bottom mlp " + str(ln_bot[0]))
-        if m_spa != m_den_out:
-            sys.exit("ERROR: arch-sparse-feature-size "
-                + str(m_spa) + " does not match last dim of bottom mlp " + str(m_den_out))
-        if num_int != ln_top[0]:
-            sys.exit("ERROR: # of feature interactions "
-                + str(num_int) + " does not match first dim of top mlp " + str(ln_top[0]))
-
-        ### initialize the model ###
-        if model is None:
-            global_init_opt = ["caffe2", "--caffe2_log_level=0"]
-            if enable_prof:
-                global_init_opt += [
-                    "--logtostderr=0",
-                    "--log_dir=$HOME",
-                    #"--caffe2_logging_print_net_summary=1",
-                ]
-            workspace.GlobalInit(global_init_opt)
-            self.set_tags()
-            self.model = model_helper.ModelHelper(name="DLRM", init_params=True)
-
-            if cli_args:
-              self.model.net.Proto().type = cli_args.caffe2_net_type
-              self.model.net.Proto().num_workers = cli_args.inter_op_workers
-
-        else:
-            # WARNING: assume that workspace and tags have been initialized elsewhere
-            self.set_tags(tag[0], tag[1], tag[2], tag[3], tag[4], tag[5], tag[6],
-                          tag[7], tag[8], tag[9])
-            self.model = model
+        if cli_args:
+          self.model.net.Proto().type = cli_args.caffe2_net_type
+          self.model.net.Proto().num_workers = cli_args.inter_op_workers
 
         # save arguments
         self.m_spa = m_spa
         self.ln_emb = ln_emb
-        self.ln_bot = ln_bot
-        self.ln_top = ln_top
-        self.arch_interaction_op = cli_args.arch_interaction_op
-        self.arch_interaction_itself = cli_args.arch_interaction_itself
-        self.sigmoid_bot = -1 # TODO: Lets not hard-code this going forward
-        self.sigmoid_top = ln_top.size - 1
         self.accel_en = accel_en
 
-        return self.create_sequential_forward_ops(id_qs, len_qs, fc_q)
+        return self.create_sequential_forward_ops(id_qs, len_qs, seq_q, hid_q)
 
     def set_tags(
         self,
         _tag_layer_top_mlp="top",
-        _tag_layer_bot_mlp="bot",
         _tag_layer_embedding="emb",
-        _tag_feature_dense_in="dense_in",
-        _tag_feature_dense_out="dense_out",
+        _tag_layer_gru="gru",
         _tag_feature_sparse_in="sparse_in",
         _tag_feature_sparse_out="sparse_out",
-        _tag_interaction="interaction",
+        _tag_feature_gru_out="gru_out",
         _tag_dense_output="prob_click",
-        _tag_dense_target="target",
     ):
         # layer tags
         self.ttop = _tag_layer_top_mlp
-        self.tbot = _tag_layer_bot_mlp
         self.temb = _tag_layer_embedding
-        # dense feature tags
-        self.tdin = _tag_feature_dense_in
-        self.tdout = _tag_feature_dense_out
+        self.tgru = _tag_layer_gru
+
         # sparse feature tags
         self.tsin = _tag_feature_sparse_in
         self.tsout = _tag_feature_sparse_out
+        self.tgruout = _tag_feature_gru_out
+
         # output and target tags
-        self.tint = _tag_interaction
-        self.ttar = _tag_dense_target
         self.tout = _tag_dense_output
 
     def parameters(self):
@@ -511,47 +502,39 @@ class DLRM_Net(object):
         self.create_model(X, S_lengths, S_indices, T)
 
     def create_input(self, X, S_lengths, S_indices, T):
-        # feed input data to blobs
-        self.FeedBlobWrapper(self.tdin, X)
-
         for i in range(len(self.emb_l)):
             len_s = self.temb + ":::" + "sls" + str(i) + "_l"
             ind_s = self.temb + ":::" + "sls" + str(i) + "_i"
             self.FeedBlobWrapper(len_s, np.array(S_lengths[i]))
             self.FeedBlobWrapper(ind_s, np.array(S_indices[i]))
 
-        # feed target data to blobs
-        if T is not None:
-            zeros_fp32 = np.zeros(T.shape).astype(np.float32)
-            self.FeedBlobWrapper(self.ttar, zeros_fp32)
+        sequence_lengths = np.zeros(X.shape[0]).astype(np.int32)
+        sequence_lengths += (len(self.ln_emb) - 3)
+        self.FeedBlobWrapper( 'seq_lengths', sequence_lengths )
 
+        initial_h_data = np.zeros( (X.shape[0], self.args.hidden_size) ).astype(np.float32)
+        self.FeedBlobWrapper( 'initial_h', initial_h_data)
 
     def create_model(self, X, S_lengths, S_indices, T):
         #setup tril indices for the interactions
-        offset = 1 if self.arch_interaction_itself else 0
         num_fea = len(self.emb_l) + 1
-        tril_indices = np.array([j + i * num_fea
-                                 for i in range(num_fea) for j in range(i + offset)])
-        self.FeedBlobWrapper(self.tint + "_tril_indices", tril_indices)
 
         # create compute graph
-        print("Trying to run DLRM for the first time")
-        sys.stdout.flush()
+        print("Trying to run DIEN for the first time")
         if T is not None:
             # WARNING: RunNetOnce call is needed only if we use brew and ConstantFill.
             # We could use direct calls to self.model functions above to avoid it
             workspace.RunNetOnce(self.model.param_init_net)
             workspace.CreateNet(self.model.net)
-        print("Ran DLRM for the first time")
-        sys.stdout.flush()
+        print("Ran DIEN for the first time")
 
 
     def run(self, X=None, S_lengths=None, S_indices=None, enable_prof=False):
         # feed input data to blobs
-        if not self.args.queue:
-            # dense features
-            self.FeedBlobWrapper(self.tdin, X)
+        # TODO: Need to make sequence_lengths an input to the overall model due
+        # to batch-size
 
+        if not self.args.queue:
             # sparse features
             for i in range(len(self.emb_l)):
                 ind_s = self.temb + ":::" + "sls" + str(i) + "_i"
@@ -559,6 +542,14 @@ class DLRM_Net(object):
 
                 len_s = self.temb + ":::" + "sls" + str(i) + "_l"
                 self.FeedBlobWrapper(len_s, np.array(S_lengths[i]))
+
+            batch_size = np.array(S_lengths).shape[1]
+            sequence_lengths = np.zeros(np.array(S_lengths).shape[1]).astype(np.int32)
+            sequence_lengths += len(self.ln_emb)
+            self.FeedBlobWrapper( 'seq_lengths', sequence_lengths )
+
+            initial_h_data = np.zeros( (np.array(S_lengths).shape[1], self.args.hidden_size) ).astype(np.float32)
+            self.FeedBlobWrapper( 'initial_h', initial_h_data)
 
         load_time = time.time()
         # execute compute graph
@@ -589,8 +580,8 @@ if __name__ == "__main__":
 
     use_accel = args.use_accel
     if use_accel:
-        device_opt = core.DeviceOption(caffe2_pb2.CUDA, 0)
-        naccels = C.num_cuda_devices  # 1
+        device_opt = core.DeviceOption(workspace.caffe2_pb2.CUDA, 0)
+        naccels = C.num_cuda_devices # 1
         print("Using {} Accel(s)...".format(naccels))
     else:
         device_opt = core.DeviceOption(caffe2_pb2.CPU)
@@ -630,11 +621,12 @@ if __name__ == "__main__":
         (nbatches, lT) = dc.generate_output_data()
 
     ### construct the neural network specified above ###
-    print("Trying to initialize DLRM")
+    print("Trying to initialized DIEN")
     with core.DeviceScope(device_opt):
-        dlrm = DLRM_Net( args )
-    print("Initialized DLRM Net")
-    dlrm.create(lX[0], lS_l[0], lS_i[0], lT[0])
+        dien = DIEN_Net( args )
+    print("Initialized DIEN Net")
+
+    dien.create(lX[0], lS_l[0], lS_i[0], lT[0])
     print("Created network")
 
     total_time = 0
@@ -648,7 +640,7 @@ if __name__ == "__main__":
             # forward and backward pass, where the latter runs only
             # when gradients and loss have been added to the net
             time_load_start = time.time()
-            time_load_end   = dlrm.run(lX[j], lS_l[j], lS_i[j], args.enable_profiling) # args.enable_profiling
+            time_load_end   = dien.run(lX[j], lS_l[j], lS_i[j], args.enable_profiling) # args.enable_profiling
             dload_time     += (time_load_end - time_load_start)
 
     time_end = time.time()
@@ -660,6 +652,7 @@ if __name__ == "__main__":
     print("Total computation time: ***", (total_time - dload_time) / (args.nepochs * nbatches), " ms/iter")
     print("Total execution time: ***", total_time, " ms")
     print("Total execution time: ***", total_time / (args.nepochs * nbatches), " ms/iter")
+    
     from utils.logging import save_log
     import sys
     file_name = sys._getframe().f_code.co_filename.split(".")[0]
